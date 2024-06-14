@@ -1,3 +1,5 @@
+# Leader Elector using `Democracy.js`
+
 `democracy.js` is a simple Node.js library for leader election in distributed systems. 
 
 ### Step-by-Step Implementation
