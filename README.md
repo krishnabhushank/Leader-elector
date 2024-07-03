@@ -703,6 +703,7 @@ import io.fabric8.kubernetes.api.model.ConfigMap;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.Watcher;
 import io.fabric8.kubernetes.client.WatcherException;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
@@ -710,13 +711,23 @@ import javax.annotation.PreDestroy;
 import java.time.Instant;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 @Service
 public class LeaderElectionService {
 
+    private static final Logger logger = Logger.getLogger(LeaderElectionService.class.getName());
+
     private final KubernetesClient kubernetesClient;
     private final String namespace = "default";
-    private final String configMapName = "leader-election";
+    
+    @Value("${configmap.name:leader-election}")
+    private String configMapName;
+
+    @Value("${pod.name}")
+    private String podName;
+
     private boolean isLeader = false;
     private Timer timer;
     private static final long LEASE_DURATION_MS = 15000; // 15 seconds
@@ -728,6 +739,7 @@ public class LeaderElectionService {
 
     @PostConstruct
     public void startLeaderElection() {
+        logger.info("Starting leader election process");
         timer = new Timer(true);
         timer.scheduleAtFixedRate(new LeaderElectionTask(), 0, RENEW_INTERVAL_MS);
         kubernetesClient.configMaps().inNamespace(namespace).withName(configMapName).watch(new ConfigMapWatcher());
@@ -738,42 +750,52 @@ public class LeaderElectionService {
         if (timer != null) {
             timer.cancel();
         }
+        logger.info("Stopped leader election process");
     }
 
     private class LeaderElectionTask extends TimerTask {
         @Override
         public void run() {
-            ConfigMap configMap = kubernetesClient.configMaps().inNamespace(namespace).withName(configMapName).get();
-            if (configMap == null) {
-                configMap = kubernetesClient.configMaps().inNamespace(namespace)
-                        .createNew()
-                        .withNewMetadata().withName(configMapName).endMetadata()
-                        .addToData("leader", "pod-name")
-                        .addToData("lease", Long.toString(Instant.now().toEpochMilli() + LEASE_DURATION_MS))
-                        .done();
-                isLeader = true;
-                return;
-            }
-
-            String currentLeader = configMap.getData().get("leader");
-            long leaseExpiration = Long.parseLong(configMap.getData().get("lease"));
-
-            if (isLeader) {
-                // Renew leadership
-                if (currentLeader.equals("pod-name") && Instant.now().toEpochMilli() < leaseExpiration) {
-                    kubernetesClient.configMaps().inNamespace(namespace).withName(configMapName).edit()
+            try {
+                ConfigMap configMap = kubernetesClient.configMaps().inNamespace(namespace).withName(configMapName).get();
+                if (configMap == null) {
+                    logger.info("ConfigMap not found, creating new ConfigMap");
+                    configMap = kubernetesClient.configMaps().inNamespace(namespace)
+                            .createNew()
+                            .withNewMetadata().withName(configMapName).endMetadata()
+                            .addToData("leader", podName)
                             .addToData("lease", Long.toString(Instant.now().toEpochMilli() + LEASE_DURATION_MS))
                             .done();
-                } else {
-                    isLeader = false;
+                    isLeader = true;
+                    logger.info("Acquired leadership");
+                    return;
                 }
-            } else if (Instant.now().toEpochMilli() > leaseExpiration) {
-                // Try to acquire leadership
-                kubernetesClient.configMaps().inNamespace(namespace).withName(configMapName).edit()
-                        .addToData("leader", "pod-name")
-                        .addToData("lease", Long.toString(Instant.now().toEpochMilli() + LEASE_DURATION_MS))
-                        .done();
-                isLeader = true;
+
+                String currentLeader = configMap.getData().get("leader");
+                long leaseExpiration = Long.parseLong(configMap.getData().get("lease"));
+
+                if (isLeader) {
+                    // Renew leadership
+                    if (currentLeader.equals(podName) && Instant.now().toEpochMilli() < leaseExpiration) {
+                        kubernetesClient.configMaps().inNamespace(namespace).withName(configMapName).edit()
+                                .addToData("lease", Long.toString(Instant.now().toEpochMilli() + LEASE_DURATION_MS))
+                                .done();
+                        logger.info("Renewed leadership");
+                    } else {
+                        isLeader = false;
+                        logger.info("Lost leadership");
+                    }
+                } else if (Instant.now().toEpochMilli() > leaseExpiration) {
+                    // Try to acquire leadership
+                    kubernetesClient.configMaps().inNamespace(namespace).withName(configMapName).edit()
+                            .addToData("leader", podName)
+                            .addToData("lease", Long.toString(Instant.now().toEpochMilli() + LEASE_DURATION_MS))
+                            .done();
+                    isLeader = true;
+                    logger.info("Acquired leadership");
+                }
+            } catch (Exception e) {
+                logger.log(Level.SEVERE, "Failed to get or create ConfigMap: " + e.getMessage(), e);
             }
         }
     }
@@ -783,14 +805,15 @@ public class LeaderElectionService {
         public void eventReceived(Action action, ConfigMap configMap) {
             String currentLeader = configMap.getData().get("leader");
             long leaseExpiration = Long.parseLong(configMap.getData().get("lease"));
-            if (!currentLeader.equals("pod-name") && Instant.now().toEpochMilli() < leaseExpiration) {
+            if (!currentLeader.equals(podName) && Instant.now().toEpochMilli() < leaseExpiration) {
                 isLeader = false;
+                logger.info("Detected new leader: " + currentLeader);
             }
         }
 
         @Override
         public void onClose(WatcherException e) {
-            // Handle close event if needed
+            logger.log(Level.SEVERE, "Watcher closed: " + e.getMessage(), e);
         }
     }
 
@@ -834,3 +857,33 @@ public class LeaderController {
 ### Suggestions for Next Steps:
 **a.** Test the sidecar deployment in a Kubernetes cluster to ensure proper leadership election and failover.  
 **b.** Add logging and monitoring to observe the leader election process and the health status of both containers.
+
+## RBAC
+
+```yaml
+# kubernetes/role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: default
+  name: leader-election-role
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "watch", "list", "create", "update", "patch"]
+
+# kubernetes/rolebinding.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leader-election-rolebinding
+  namespace: default
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: default
+roleRef:
+  kind: Role
+  name: leader-election-role
+  apiGroup: rbac.authorization.k8s.io
+```
